@@ -24,7 +24,6 @@ public class ImageResizer {
         //开始加载照片
         BitmapFactory.decodeResource(res,resId,options);
 
-
         //imSampleSize
         options.inSampleSize = calculateInSample(options,reqWidth,reqHeight);
 
@@ -66,7 +65,6 @@ public class ImageResizer {
                 inSampleSize *= 2;
             }
         }
-
         return inSampleSize;
     }
 }
