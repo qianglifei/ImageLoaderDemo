@@ -1,10 +1,13 @@
 package com.example.administrator.imageloaderdemo;
 
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.Looper;
 import android.os.Message;
 import android.os.StatFs;
 import android.util.Log;
@@ -13,8 +16,18 @@ import android.widget.ImageView;
 
 import com.jakewharton.disklrucache.DiskLruCache;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
@@ -152,13 +165,166 @@ public class ImageLoader {
             Log.i(TAG, "loadBitmapFromMemCache: " + uri);
             return bitmap;
         }
+        try {
+            bitmap = loadBitmapFromDiskCache(uri,reqWidth,reqHeight);
+            if (bitmap != null){
+                Log.i(TAG, "loadBitmapFromDisk,url" + uri);
+                return bitmap;
+            }
+            bitmap = loadBitmapFromHttp(uri,reqWidth,reqHeight);
+            Log.i(TAG, "===loadBitmapFromHttp: " + uri);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        if (bitmap != null && !mIsDiskLruCacheCreated){
+            Log.w(TAG, "encounter error,DiskLruCache is not created.");
+            bitmap = downloadBitmapFromUrl(uri);
+        }
+
+        return bitmap;
     }
 
-    private Bitmap loadBitmapFromMemCache(String uri) {
+    private Bitmap downloadBitmapFromUrl(String urlString) {
+        Bitmap bitmap = null;
+        HttpURLConnection urlConnection = null;
+        BufferedInputStream in = null;
+        try {
+            final URL url = new URL(urlString);
+            urlConnection = (HttpURLConnection) url.openConnection();
+            in = new BufferedInputStream(urlConnection.getInputStream(),IO_BUFFER_SIZE);
+            bitmap = BitmapFactory.decodeStream(in);
+        } catch (IOException e) {
+            e.printStackTrace();
+            Log.i(TAG, "Error in downloadBitmap：" + e);
+        }finally {
+            if (urlConnection != null){
+                urlConnection.disconnect();
+            }
+            try {
+                in.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        return bitmap;
     }
 
+    private Bitmap loadBitmapFromDiskCache(String url, int reqWidth, int reqHeight) throws IOException{
+        if (Looper.myLooper() == Looper.getMainLooper()){
+            Log.w(TAG, "load Bitmap From URL Thread,it is not recommended!");
+        }
+        if (mDiskLruCache == null){
+            return null;
+        }
+        Bitmap bitmap = null;
+        String key = hashKeyFromUrl(url);
+        DiskLruCache.Snapshot snapshot = mDiskLruCache.get(key);
+        if (snapshot != null){
+            FileInputStream fileInputStream = (FileInputStream) snapshot.
+                    getInputStream(DISK_BUFFER_INDEX);
+            FileDescriptor fileDescriptor = fileInputStream.getFD();
+            bitmap = mImageResizer.decodeSampledBitmapFromFileDescriptor(fileDescriptor,reqWidth,reqHeight);
+            if (bitmap != null) {
+                addBitmapToMemoryCache(key,bitmap);
+            }
+        }
 
+        return bitmap;
+    }
 
+    private Bitmap loadBitmapFromHttp(String url, int reqWidth, int reqHeight) throws IOException {
+        if (Looper.myLooper() == Looper.getMainLooper()){
+            throw new RuntimeException("can not visit network from UI Thread");
+        }
+
+        if (mDiskLruCache == null){
+            return null;
+        }
+
+        String key = hashKeyFromUrl(url);
+        try {
+            DiskLruCache.Editor editor = mDiskLruCache.edit(key);
+            if (editor != null){
+                OutputStream outputStream = editor.newOutputStream(DISK_BUFFER_INDEX);
+                if (downloadBitmapToStream(url,outputStream)){
+                    editor.commit();
+                }else {
+                    editor.abort();
+                }
+                mDiskLruCache.flush();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return loadBitmapFromDiskCache(url,reqWidth,reqHeight);
+    }
+
+    private boolean downloadBitmapToStream(String urlString, OutputStream outputStream) {
+        HttpURLConnection urlConnection = null;
+        BufferedOutputStream out = null;
+        BufferedInputStream in = null;
+        try {
+            final URL url = new URL(urlString);
+            urlConnection = (HttpURLConnection) url.openConnection();
+            in = new BufferedInputStream(urlConnection.getInputStream(),IO_BUFFER_SIZE);
+            out = new BufferedOutputStream(outputStream,IO_BUFFER_SIZE);
+
+            int b;
+            while ((b = in.read()) != -1){
+                out.write(b);
+            }
+            return true;
+        } catch (MalformedURLException e) {
+            e.printStackTrace();
+            Log.e(TAG, "downloadBitmapToStream failed: " + e);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }finally {
+            if (urlConnection != null){
+                urlConnection.disconnect();
+            }
+            try {
+                out.close();
+                in.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        return false;
+    }
+
+    private Bitmap loadBitmapFromMemCache(String url) {
+        final String key = hashKeyFromUrl(url);
+        Bitmap bitmap = getBitmapFromMemCache(key);
+        return bitmap;
+    }
+
+    private String hashKeyFromUrl(String url) {
+        String cacheKey;
+        try {
+            final MessageDigest mDigest = MessageDigest.getInstance("MD5");
+            mDigest.update(url.getBytes());
+            cacheKey = bytesToHexString(mDigest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            cacheKey = String.valueOf(url.hashCode());
+        }
+        return cacheKey;
+    }
+
+    private String bytesToHexString(byte[] digest) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < digest.length ; i++) {
+            String hex = Integer.toHexString(digest[i] & 0xFF );
+            if (hex.length() == 1){
+                sb.append('0');
+            }
+            sb.append(hex);
+        }
+        return sb.toString();
+    }
 
     private long getUsableSpace(File path) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.GINGERBREAD){
@@ -180,7 +346,6 @@ public class ImageLoader {
         }
         return new File(cachePath + File.separator + uniqueName);
     }
-
 
     private static class LoaderResult{
         public ImageView mImageView;
